@@ -386,14 +386,16 @@
 
         const $ = (id) => document.getElementById(id);
         let client, msgCount = 0, movTopic, statTopic;
-        let lastSeq = -1, lastTs = 0, lastRx = 0;
+        let lastSeq = -1, lastTs = 0, lastRx = 0, lastAlert = "";
         let state = {
             movement: "IDLE", locked: false, target: null,
             locked_face_found: false, faces: 0, error_x: 0, raw_error_x: 0,
             confidence: null, target_distance: null, threshold: null,
             tracking_zone: "IDLE", deadzone_px: null, center_zone_ratio: 0.36,
             center_zone_half_width_px: null, fps: null, resolution: { width: 960, height: 540 },
-            profile_ms: {}, mqtt_connected: null, seq: null,
+            profile_ms: {}, mqtt_connected: null,             scanning: false,
+            alert_message: "",
+            seq: null,
         };
 
         function normCmd(c) {
@@ -446,10 +448,14 @@
         function updateHint() {
             const s = state;
             let html = "";
-            if (!s.locked) {
+            if (s.alert_message) {
+                html = `<strong>${esc(s.alert_message)}</strong> — re-acquired during SEARCH; tracking resumes.`;
+            } else if (s.scanning || s.movement === "SCAN") {
+                html = `<strong>SEARCHING</strong> for ${esc(s.target || "target")} — when they return you should see <strong>${esc(s.target || "target")} found, stop!</strong>`;
+            } else if (!s.locked) {
                 html = "<strong>Stage: Recognition.</strong> Run recognize_mqtt, face the camera, press <strong>l</strong> when Elvin is recognized to enable speaker lock.";
             } else if (s.movement === "SCAN" || (s.locked && !s.locked_face_found)) {
-                html = "<strong>Stage: Search / re-acquisition.</strong> Locked speaker is out of frame or occluded. Servo should sweep (SCAN). Return to frame to re-acquire the same identity.";
+                html = `<strong>Stage: Search / re-acquisition.</strong> Locked speaker is out of frame or occluded. Servo should sweep (SCAN). When ${esc(s.target || "target")} returns you should see <strong>${esc(s.target || "target")} found, stop!</strong>`;
             } else if (s.locked_face_found) {
                 html = `<strong>Stage: Tracking.</strong> Locked on <strong>${esc(s.target || "?")}</strong>. Move left/right — expect LEFT / RIGHT / CENTER on dashboard and servo motion.`;
             } else {
@@ -556,9 +562,16 @@
                 resolution: st.resolution || state.resolution,
                 profile_ms: st.profile_ms || state.profile_ms,
                 mqtt_connected: st.mqtt_connected ?? state.mqtt_connected,
+                scanning: Boolean(st.scanning),
+                alert_message: st.alert_message || "",
                 seq: Number.isFinite(seq) ? seq : state.seq,
             };
 
+            if (state.alert_message && state.alert_message !== lastAlert) {
+                log("search", "FOUND", state.alert_message);
+                lastAlert = state.alert_message;
+            }
+            if (!state.alert_message) lastAlert = "";
             if (state.movement !== prevM) log("motor", state.movement, CMD_DESC[normCmd(state.movement)] || "");
             if (state.locked !== prevL) log("lock", state.locked ? "LOCK" : "UNLOCK", state.target || "");
             render();

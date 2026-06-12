@@ -42,6 +42,7 @@ except Exception as e:
 # Reuse your known-good alignment method
 from .haar_5pt import align_face_5pt
 from .enroll import open_camera
+from .action_history import ActionHistoryLogger, save_action_history
 from .ui_keys import decode_cv_key, focus_cv_window, is_quit_key, pump_cv_key
 from .onnx_providers import select_provider_interactive, get_provider_display_name
 
@@ -61,7 +62,10 @@ class FaceDet:
 
 class ActionType(Enum):
     FACE_LOCKED = auto()
+    FACE_UNLOCKED = auto()
     FACE_LOST = auto()
+    FACE_REACQUIRED = auto()
+    SCAN_STARTED = auto()
     HEAD_LEFT = auto()
     HEAD_RIGHT = auto()
     EYE_BLINK = auto()
@@ -568,20 +572,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def save_action_history(face_name: str, actions: List[Action]):
-    if not actions:
-        return
-    
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    filename = f"{face_name}_history_{timestamp}.txt"
-    os.makedirs("logs", exist_ok=True)
-    
-    with open(f"logs/{filename}", "w") as f:
-        for action in actions:
-            time_str = datetime.fromtimestamp(action.timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")
-            f.write(f"{time_str} - {action.type.name}: {action.details}\n")
-
-
 def configure_cv_for_cpu(thread_count: int) -> None:
     cv2.setUseOptimized(True)
     if thread_count >= 0:
@@ -605,6 +595,16 @@ def stable_label_from_history(history: List[str]) -> str:
     return "Unknown"
 
 
+def target_display_label(mr: MatchResult, target_name: str) -> str:
+    if mr.name == target_name and mr.accepted:
+        return target_name
+    return "Unknown"
+
+
+def is_target_match(mr: MatchResult, target_name: str) -> bool:
+    return mr.name == target_name and mr.accepted
+
+
 def recognize_with_cache(
     frame: np.ndarray,
     face: FaceDet,
@@ -616,6 +616,7 @@ def recognize_with_cache(
     smoothing_window: int,
     label_smoothing_window: int,
     recognize_every: int,
+    target_name: Optional[str] = None,
 ) -> Tuple[MatchResult, str, Optional[np.ndarray], bool]:
     should_recognize = cache.match is None or ((frame_index + face_index) % recognize_every == 0)
     if should_recognize:
@@ -629,7 +630,10 @@ def recognize_with_cache(
         emb = emb_stack.mean(axis=0)
         emb = (emb / (np.linalg.norm(emb) + 1e-12)).astype(np.float32)
         mr = matcher.match(emb)
-        raw_label = mr.name if mr.name is not None and mr.accepted else "Unknown"
+        if target_name:
+            raw_label = target_display_label(mr, target_name)
+        else:
+            raw_label = mr.name if mr.name is not None and mr.accepted else "Unknown"
         cache.label_history.append(raw_label)
         if len(cache.label_history) > label_smoothing_window:
             cache.label_history.pop(0)
@@ -794,6 +798,8 @@ def main():
 
     label_smoothing_window = 7  # More frames here = more stable, slightly slower to react
     
+    action_logger = ActionHistoryLogger()
+    
     try:
         while True:
             frame_started_at = time.perf_counter()
@@ -834,7 +840,13 @@ def main():
             
             # Check if we should unlock due to timeout
             if face_lock and (current_time - face_lock.last_seen) > max_timeout:
-                save_action_history(face_lock.target_name, face_lock.history)
+                unlock_action = Action(
+                    ActionType.FACE_UNLOCKED,
+                    current_time,
+                    f"Timeout unlock: {face_lock.target_name}",
+                )
+                face_lock.history.append(unlock_action)
+                action_logger.log_action(face_lock.target_name, unlock_action)
                 print(f"[FaceLock] Timeout - Unlocked {face_lock.target_name}")
                 face_lock = None
                 selected_face_index = None
@@ -865,6 +877,7 @@ def main():
                     smoothing_window=smoothing_window,
                     label_smoothing_window=label_smoothing_window,
                     recognize_every=args.recognize_every,
+                    target_name=args.target_name,
                 )
                 if recognized_now:
                     last_profile["recognize"] += (time.perf_counter() - recognize_started_at) * 1000.0
@@ -881,32 +894,34 @@ def main():
                             last_action_print_at[action.type] = current_time
                     face_lock.history.extend(actions)
                     for action in actions:
+                        action_logger.log_action(face_lock.target_name, action)
                         print(f"[Action] {action.type.name}: {action.details}")
                     is_locked_face = True
                 
-                # label (use smoothed/stable label for display to reduce flicker)
-                label = stable_label
+                is_target = is_target_match(mr, args.target_name)
+                display_label = target_display_label(mr, args.target_name)
+                label = display_label
                 status = " (LOCKED)" if is_locked_face else ""
                 line1 = f"{label}{status}"
-                line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
+                line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}" if is_target else "non-target face"
                 
                 # Determine if this face is selected for locking
                 is_selected = (selected_face_index == i) if selected_face_index is not None else False
                 
-                # Auto-select first recognized face if no manual selection
-                if selected_face_index is None and not face_lock and mr.name and mr.accepted:
+                # Auto-select first target face only
+                if selected_face_index is None and not face_lock and is_target:
                     selected_face_index = i
                     is_selected = True
-                    potential_face_to_lock = (mr.name, cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32), f.kps)
+                    potential_face_to_lock = (args.target_name, cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32), f.kps)
                 
                 # Update potential lock target if this is the selected face
                 if is_selected and not face_lock:
-                    if mr.name and mr.accepted:
-                        potential_face_to_lock = (mr.name, cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32), f.kps)
+                    if is_target:
+                        potential_face_to_lock = (args.target_name, cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32), f.kps)
                     else:
                         potential_face_to_lock = None
                 
-                # color and border: locked > selected > known > unknown
+                # color and border: locked > selected > target > unknown
                 if is_locked_face:
                     color = (255, 165, 0)  # Orange for locked face
                     border_thickness = 4
@@ -915,11 +930,14 @@ def main():
                     color = (255, 255, 0)  # Cyan/Yellow for selected face
                     border_thickness = 4
                     cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, border_thickness)
-                    # Draw selection indicator
                     cv2.circle(vis, (f.x1 + 15, f.y1 + 15), 8, color, -1)
                     draw_text_with_shadow(vis, "SELECTED", (f.x1, f.y2 + 25), 0.65, color, 1, font=cv2.FONT_HERSHEY_DUPLEX)
+                elif is_target:
+                    color = (0, 255, 0)
+                    border_thickness = 2
+                    cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, border_thickness)
                 else:
-                    color = (0, 255, 0) if mr.accepted else (0, 0, 255)
+                    color = (0, 0, 255)  # Unknown
                     border_thickness = 2
                     cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, border_thickness)
                 
@@ -1041,7 +1059,13 @@ def main():
                 print(f"[recognize] debug overlay: {'ON' if show_debug else 'OFF'}")
             elif ascii_key == ord('l'):  # Lock/unlock face
                 if face_lock:  # Unlock if already locked
-                    save_action_history(face_lock.target_name, face_lock.history)
+                    unlock_action = Action(
+                        ActionType.FACE_UNLOCKED,
+                        current_time,
+                        f"Manual unlock: {face_lock.target_name}",
+                    )
+                    face_lock.history.append(unlock_action)
+                    action_logger.log_action(face_lock.target_name, unlock_action)
                     print(f"[FaceLock] Unlocked {face_lock.target_name}")
                     face_lock = None
                     selected_face_index = None
@@ -1055,14 +1079,26 @@ def main():
                         last_seen=current_time
                     )
                     face_lock.update_position(kps)  # Initialize position tracking
-                    face_lock.history.append(Action(
+                    lock_action = Action(
                         ActionType.FACE_LOCKED,
                         current_time,
-                        f"Face locked: {name}"
-                    ))
+                        f"Face locked: {name}",
+                    )
+                    face_lock.history.append(lock_action)
+                    action_logger.log_action(name, lock_action)
                     print(f"[FaceLock] Locked onto {name} (face {selected_face_index + 1 if selected_face_index is not None else '?'})")
                     # Keep selection for visual feedback, but locking is done
     finally:
+        if face_lock is not None and face_lock.history:
+            end_action = Action(
+                ActionType.FACE_UNLOCKED,
+                time.time(),
+                f"Session ended while locked: {face_lock.target_name}",
+            )
+            face_lock.history.append(end_action)
+            action_logger.log_action(face_lock.target_name, end_action)
+            if action_logger.path is not None:
+                print(f"[ActionHistory] Saved to {action_logger.path}")
         det.close()
         cap.release()
         cv2.destroyAllWindows()

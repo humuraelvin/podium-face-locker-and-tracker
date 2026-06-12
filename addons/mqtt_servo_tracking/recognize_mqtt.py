@@ -50,7 +50,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.haar_5pt import align_face_5pt
+from src.enroll import open_camera
 from src.onnx_providers import select_provider_interactive, get_provider_display_name
+from src.action_history import ActionHistoryLogger
 from src.ui_keys import decode_cv_key, focus_cv_window, is_quit_key, pump_cv_key
 
 # -------------------------
@@ -67,6 +69,7 @@ class FaceDet:
 
 class ActionType(Enum):
     FACE_LOCKED = auto()
+    FACE_UNLOCKED = auto()
     FACE_LOST = auto()
     FACE_REACQUIRED = auto()
     SCAN_STARTED = auto()
@@ -606,6 +609,44 @@ def draw_center_zone_guides(img: np.ndarray, center_zone_half_width_px: float) -
     cv2.line(img, (right, 0), (right, h), (80, 190, 150), 1, cv2.LINE_AA)
     cv2.line(img, (center_x, 0), (center_x, h), (200, 220, 220), 1, cv2.LINE_AA)
 
+
+class OverlayEventLog:
+    """Recent dashboard-style events drawn on the camera window."""
+
+    MAX_ITEMS = 10
+
+    def __init__(self) -> None:
+        self.items: List[Tuple[str, str, str]] = []
+
+    def add(self, kind: str, tag: str, text: str) -> None:
+        self.items.insert(0, (kind, tag, text))
+        self.items = self.items[: self.MAX_ITEMS]
+
+    def draw(self, img: np.ndarray, origin: Tuple[int, int], width: int) -> int:
+        if not self.items:
+            return origin[1]
+        lines = [f"{tag}: {text}" for _, tag, text in self.items]
+        return draw_info_panel(
+            img,
+            "LIVE EVENT LOG",
+            lines,
+            origin,
+            width,
+            (120, 190, 255),
+            0.72,
+        )
+
+
+def target_display_label(mr: MatchResult, target_name: str) -> str:
+    """Only the enrolled target gets a name; every other face is Unknown."""
+    if mr.name == target_name and mr.accepted:
+        return target_name
+    return "Unknown"
+
+
+def is_target_match(mr: MatchResult, target_name: str) -> bool:
+    return mr.name == target_name and mr.accepted
+
 # -------------------------
 # MQTT movement control
 # -------------------------
@@ -683,6 +724,8 @@ def build_dashboard_status(
     camera_width: int,
     camera_height: int,
     profile_ms: Dict[str, float],
+    alert_message: str = "",
+    scanning: bool = False,
 ) -> Dict[str, object]:
     return {
         "seq": int(seq),
@@ -704,6 +747,8 @@ def build_dashboard_status(
         "center_zone_half_width_px": round(float(center_zone_half_width_px), 2),
         "deadzone_px": round(float(effective_deadzone_px), 2),
         "tracking_zone": tracking_zone,
+        "scanning": bool(scanning),
+        "alert_message": alert_message or "",
         "resolution": {"width": int(camera_width), "height": int(camera_height)},
         "profile_ms": {key: round(float(value), 2) for key, value in profile_ms.items()},
     }
@@ -919,7 +964,7 @@ def parse_args() -> argparse.Namespace:
         default=0.25,
         help="Minimum seconds between dashboard status MQTT messages.",
     )
-    parser.add_argument("--camera-index", type=int, default=1, help="OpenCV camera index.")
+    parser.add_argument("--camera-index", type=int, default=-1, help="OpenCV camera index (-1 = auto try 0,1,2).")
     parser.add_argument("--camera-width", type=int, default=DEFAULT_CAMERA_WIDTH, help="Requested camera width.")
     parser.add_argument("--camera-height", type=int, default=DEFAULT_CAMERA_HEIGHT, help="Requested camera height.")
     parser.add_argument("--max-faces", type=int, default=5, help="Maximum faces to detect when unlocked.")
@@ -962,18 +1007,10 @@ def parse_args() -> argparse.Namespace:
 # -------------------------
 # Demo
 # -------------------------
-def save_action_history(face_name: str, actions: List[Action]):
-    if not actions:
-        return
-    
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    filename = f"{face_name}_history_{timestamp}.txt"
-    os.makedirs("logs", exist_ok=True)
-    
-    with open(f"logs/{filename}", "w") as f:
-        for action in actions:
-            time_str = datetime.fromtimestamp(action.timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")
-            f.write(f"{time_str} - {action.type.name}: {action.details}\n")
+def log_face_actions(action_logger: ActionHistoryLogger, face_name: str, actions: List[Action]) -> None:
+    for action in actions:
+        action_logger.log_action(face_name, action)
+        print(f"[Action] {action.type.name}: {action.details}")
 
 
 def configure_cv_for_cpu(thread_count: int) -> None:
@@ -1010,6 +1047,7 @@ def recognize_with_cache(
     smoothing_window: int,
     label_smoothing_window: int,
     recognize_every: int,
+    target_name: Optional[str] = None,
 ) -> Tuple[MatchResult, str, Optional[np.ndarray], bool]:
     should_recognize = cache.match is None or ((frame_index + face_index) % recognize_every == 0)
     if should_recognize:
@@ -1023,7 +1061,10 @@ def recognize_with_cache(
         emb = emb_stack.mean(axis=0)
         emb = (emb / (np.linalg.norm(emb) + 1e-12)).astype(np.float32)
         mr = matcher.match(emb)
-        raw_label = mr.name if mr.name is not None and mr.accepted else "Unknown"
+        if target_name:
+            raw_label = target_display_label(mr, target_name)
+        else:
+            raw_label = mr.name if mr.name is not None and mr.accepted else "Unknown"
         cache.label_history.append(raw_label)
         if len(cache.label_history) > label_smoothing_window:
             cache.label_history.pop(0)
@@ -1155,11 +1196,23 @@ def main():
     # Default threshold 0.40 for better recall (can be adjusted with +/-)
     matcher = FaceDBMatcher(db=db, dist_thresh=0.40)
     
-    cap = cv2.VideoCapture(args.camera_index)
-    if not cap.isOpened():
-        print("Camera not available")
-        det.close()
-        return
+    if args.camera_index < 0:
+        try:
+            cap, camera_index = open_camera((0, 1, 2))
+        except RuntimeError as e:
+            print(f"Camera not available: {e}")
+            det.close()
+            return
+    else:
+        cap = cv2.VideoCapture(args.camera_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(args.camera_index)
+        if not cap.isOpened():
+            print(f"Camera not available on index {args.camera_index}")
+            det.close()
+            return
+        camera_index = args.camera_index
+        print(f"Camera ready on index {camera_index}")
     
     camera_width = args.camera_width
     camera_height = args.camera_height
@@ -1209,6 +1262,11 @@ def main():
     face_missing_since: Optional[float] = None
     reacquire_hold_until = 0.0
     scan_started_logged = False
+    alert_message = ""
+    alert_until = 0.0
+    overlay_log = OverlayEventLog()
+    prev_movement_command = MOVEMENT_IDLE
+    prev_locked = False
     mqtt_publisher: Optional[MqttMovementPublisher] = None
     status_seq = 0
     frame_index = 0
@@ -1223,6 +1281,7 @@ def main():
         min_interval_sec=args.evidence_log_interval_sec,
         enabled=not args.disable_evidence_log,
     )
+    action_logger = ActionHistoryLogger()
 
     if args.disable_mqtt:
         print("[MQTT] Disabled by flag (--disable-mqtt)")
@@ -1301,7 +1360,13 @@ def main():
             
             # Check if we should unlock due to timeout
             if face_lock and (current_time - face_lock.last_seen) > max_timeout:
-                save_action_history(face_lock.target_name, face_lock.history)
+                unlock_action = Action(
+                    ActionType.FACE_UNLOCKED,
+                    current_time,
+                    f"Timeout unlock: {face_lock.target_name}",
+                )
+                face_lock.history.append(unlock_action)
+                action_logger.log_action(face_lock.target_name, unlock_action)
                 print(f"[FaceLock] Timeout - Unlocked {face_lock.target_name}")
                 face_lock = None
                 selected_face_index = None
@@ -1349,6 +1414,7 @@ def main():
                     smoothing_window=smoothing_window,
                     label_smoothing_window=label_smoothing_window,
                     recognize_every=args.recognize_every,
+                    target_name=args.target_name,
                 )
                 if recognized_now:
                     last_profile["recognize"] += (time.perf_counter() - recognize_started_at) * 1000.0
@@ -1368,50 +1434,51 @@ def main():
                             actions.append(action)
                             last_action_print_at[action.type] = current_time
                     face_lock.history.extend(actions)
-                    for action in actions:
-                        print(f"[Action] {action.type.name}: {action.details}")
+                    log_face_actions(action_logger, face_lock.target_name, actions)
                     is_locked_face = True
                     locked_face_found = True
                     locked_face_kps = f.kps.copy()
                     locked_face_bbox = [int(f.x1), int(f.y1), int(f.x2), int(f.y2)]
 
+                is_target = is_target_match(mr, args.target_name)
+                display_label = target_display_label(mr, args.target_name)
+
                 frame_match_records.append(
                     {
                         "index": int(i),
                         "bbox": [int(f.x1), int(f.y1), int(f.x2), int(f.y2)],
-                        "accepted": bool(mr.accepted),
-                        "name": mr.name,
-                        "stable_label": stable_label,
+                        "accepted": bool(is_target),
+                        "name": display_label,
+                        "stable_label": display_label,
                         "similarity": round(float(mr.similarity), 4),
                         "distance": round(float(mr.distance), 4),
-                        "is_target": bool(mr.name == args.target_name and mr.accepted),
+                        "is_target": bool(is_target),
                         "is_locked_face": bool(is_locked_face),
                     }
                 )
                 
-                # label (use smoothed/stable label for display to reduce flicker)
-                label = stable_label
+                label = display_label
                 status = " (LOCKED)" if is_locked_face else ""
                 line1 = f"{label}{status}"
-                line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
+                line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}" if is_target else "non-target face"
                 
                 # Determine if this face is selected for locking
                 is_selected = (selected_face_index == i) if selected_face_index is not None else False
                 
-                # Auto-select first recognized face if no manual selection
-                if selected_face_index is None and not face_lock and mr.name and mr.accepted:
+                # Auto-select first target face only
+                if selected_face_index is None and not face_lock and is_target:
                     selected_face_index = i
                     is_selected = True
-                    potential_face_to_lock = (mr.name, cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32), f.kps)
+                    potential_face_to_lock = (args.target_name, cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32), f.kps)
                 
                 # Update potential lock target if this is the selected face
                 if is_selected and not face_lock:
-                    if mr.name and mr.accepted:
-                        potential_face_to_lock = (mr.name, cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32), f.kps)
+                    if is_target:
+                        potential_face_to_lock = (args.target_name, cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32), f.kps)
                     else:
                         potential_face_to_lock = None
                 
-                # color and border: locked > selected > known > unknown
+                # color and border: locked > selected > target > unknown
                 if is_locked_face:
                     color = (255, 165, 0)  # Orange for locked face
                     border_thickness = 4
@@ -1420,11 +1487,14 @@ def main():
                     color = (255, 255, 0)  # Cyan/Yellow for selected face
                     border_thickness = 4
                     cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, border_thickness)
-                    # Draw selection indicator
                     cv2.circle(vis, (f.x1 + 15, f.y1 + 15), 8, color, -1)
                     draw_text_with_shadow(vis, "SELECTED", (f.x1, f.y2 + 25), 0.65, color, 1, font=cv2.FONT_HERSHEY_DUPLEX)
+                elif is_target:
+                    color = (0, 255, 0)
+                    border_thickness = 2
+                    cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, border_thickness)
                 else:
-                    color = (0, 255, 0) if mr.accepted else (0, 0, 255)
+                    color = (0, 0, 255)  # Unknown / non-target
                     border_thickness = 2
                     cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, border_thickness)
                 
@@ -1467,9 +1537,13 @@ def main():
                     detail = "Target face reacquired"
                     if was_scanning:
                         detail += " after SCAN"
+                        alert_message = f"{args.target_name} found, stop!"
+                        alert_until = current_time + 4.0
+                        overlay_log.add("search", "FOUND", alert_message)
+                        print(f"[Search] {alert_message}")
                     reacquired_action = Action(ActionType.FACE_REACQUIRED, current_time, detail)
                     face_lock.history.append(reacquired_action)
-                    print(f"[Action] {reacquired_action.type.name}: {reacquired_action.details}")
+                    log_face_actions(action_logger, face_lock.target_name, [reacquired_action])
                 face_missing_since = None
                 scan_started_logged = False
                 raw_error_x = compute_face_error_x(locked_face_kps, frame_width=w)
@@ -1523,7 +1597,7 @@ def main():
                     face_missing_since = current_time
                     lost_action = Action(ActionType.FACE_LOST, current_time, "Target face out of frame or occluded")
                     face_lock.history.append(lost_action)
-                    print(f"[Action] {lost_action.type.name}: {lost_action.details}")
+                    log_face_actions(action_logger, face_lock.target_name, [lost_action])
                 lost_for = current_time - face_missing_since
                 if lost_for < args.scan_delay_sec:
                     movement_command = MOVEMENT_IDLE
@@ -1533,7 +1607,9 @@ def main():
                         scan_action = Action(ActionType.SCAN_STARTED, current_time, "Started SCAN to reacquire target")
                         face_lock.history.append(scan_action)
                         scan_started_logged = True
-                        print(f"[Action] {scan_action.type.name}: {scan_action.details}")
+                        scan_msg = f"SEARCHING for {args.target_name}..."
+                        overlay_log.add("search", "SCAN", scan_msg)
+                        log_face_actions(action_logger, face_lock.target_name, [scan_action])
                 pending_track_command = None
                 pending_track_count = 0
                 movement_error_x = 0.0
@@ -1561,6 +1637,9 @@ def main():
             )
             movement_command = visible_movement_command
 
+            active_alert = alert_message if current_time < alert_until else ""
+            is_scanning = movement_command == MOVEMENT_SCAN
+
             status_seq += 1
             status_payload = build_dashboard_status(
                 seq=status_seq,
@@ -1583,6 +1662,8 @@ def main():
                 camera_width=w,
                 camera_height=h,
                 profile_ms=last_profile,
+                alert_message=active_alert,
+                scanning=is_scanning,
             )
             status_payload["mqtt_connected"] = bool(mqtt_publisher is not None and mqtt_publisher.connected)
 
@@ -1591,6 +1672,25 @@ def main():
             if mqtt_publisher is not None:
                 mqtt_movement_result = mqtt_publisher.publish(movement_command)
                 mqtt_status_result = mqtt_publisher.publish_status(status_payload)
+
+            locked_now = face_lock is not None
+            if movement_command != prev_movement_command:
+                overlay_log.add("motor", movement_command, f"zone={tracking_zone} err={movement_error_x:+.1f}px")
+                prev_movement_command = movement_command
+            if locked_now != prev_locked:
+                if locked_now:
+                    overlay_log.add("lock", "LOCK", f"Locked {face_lock.target_name}")
+                else:
+                    overlay_log.add("lock", "UNLOCK", "Speaker unlocked")
+                prev_locked = locked_now
+
+            if status_seq % 25 == 0:
+                found = "found" if locked_face_found else "not found"
+                overlay_log.add(
+                    "status",
+                    "telemetry",
+                    f"{movement_command} / {tracking_zone} / locked_face={found}",
+                )
 
             evidence_logger.write(
                 {
@@ -1638,11 +1738,44 @@ def main():
                 movement_line,
                 f"faces={len(faces)}  locked_face={found_text}  fps={fps_text}",
                 f"confidence={confidence_text}  distance={distance_text}  threshold={matcher.dist_thresh:.3f}",
+                f"mqtt_move={mqtt_movement_result}  mqtt_status={mqtt_status_result}",
             ]
+            if is_scanning:
+                summary_lines.append(f"SEARCHING — looking for {args.target_name}")
+            if active_alert:
+                summary_lines.append(active_alert)
             debug_panel_width = min(410, max(300, w // 3)) if show_debug else 0
             summary_width_limit = w - debug_panel_width - 36 if show_debug else w - 24
             summary_width = max(300, min(560, summary_width_limit))
-            draw_info_panel(vis, "FACE LOCK TELEMETRY", summary_lines, (12, 12), summary_width, accent, 0.58)
+            telemetry_bottom = draw_info_panel(vis, "FACE LOCK TELEMETRY", summary_lines, (12, 12), summary_width, accent, 0.58)
+
+            event_log_width = max(300, min(420, w - 24))
+            overlay_log.draw(vis, (12, telemetry_bottom + 10), event_log_width)
+
+            if active_alert:
+                draw_text_box(
+                    vis,
+                    active_alert,
+                    (max(12, w // 2 - 180), max(48, h // 8)),
+                    1.0,
+                    (80, 255, 120),
+                    (0, 60, 30),
+                    0.85,
+                    10,
+                    cv2.FONT_HERSHEY_DUPLEX,
+                )
+            elif is_scanning:
+                draw_text_box(
+                    vis,
+                    f"SEARCHING — {args.target_name}?",
+                    (max(12, w // 2 - 160), max(48, h // 8)),
+                    0.85,
+                    (100, 200, 255),
+                    (20, 40, 80),
+                    0.8,
+                    8,
+                    cv2.FONT_HERSHEY_DUPLEX,
+                )
 
             if args.profile or show_debug:
                 last_profile["draw"] = (time.perf_counter() - frame_started_at) * 1000.0
@@ -1757,7 +1890,13 @@ def main():
                 print(f"[recognize] debug overlay: {'ON' if show_debug else 'OFF'}")
             elif ascii_key == ord('l'):  # Lock/unlock face
                 if face_lock:  # Unlock if already locked
-                    save_action_history(face_lock.target_name, face_lock.history)
+                    unlock_action = Action(
+                        ActionType.FACE_UNLOCKED,
+                        current_time,
+                        f"Manual unlock: {face_lock.target_name}",
+                    )
+                    face_lock.history.append(unlock_action)
+                    action_logger.log_action(face_lock.target_name, unlock_action)
                     print(f"[FaceLock] Unlocked {face_lock.target_name}")
                     face_lock = None
                     selected_face_index = None
@@ -1782,11 +1921,13 @@ def main():
                         last_seen=current_time
                     )
                     face_lock.update_position(kps)  # Initialize position tracking
-                    face_lock.history.append(Action(
+                    lock_action = Action(
                         ActionType.FACE_LOCKED,
                         current_time,
-                        f"Face locked: {name}"
-                    ))
+                        f"Face locked: {name}",
+                    )
+                    face_lock.history.append(lock_action)
+                    action_logger.log_action(name, lock_action)
                     filtered_error_x = None
                     stable_track_command = MOVEMENT_CENTER
                     visible_movement_command = MOVEMENT_CENTER
@@ -1872,6 +2013,17 @@ def main():
             force=True,
         )
         evidence_logger.close()
+
+        if face_lock is not None and face_lock.history:
+            end_action = Action(
+                ActionType.FACE_UNLOCKED,
+                shutdown_time,
+                f"Session ended while locked: {face_lock.target_name}",
+            )
+            face_lock.history.append(end_action)
+            action_logger.log_action(face_lock.target_name, end_action)
+            if action_logger.path is not None:
+                print(f"[ActionHistory] Saved to {action_logger.path}")
 
         if mqtt_publisher is not None:
             mqtt_publisher.close()
