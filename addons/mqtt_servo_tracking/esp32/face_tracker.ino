@@ -25,12 +25,12 @@ const int SERVO_MIN_ANGLE = 0;
 const int SERVO_MAX_ANGLE = 180;
 const int SERVO_CENTER_ANGLE = 90;
 
-const int TRACK_STEP = 8;
-const int SEARCH_STEP = 12;
+const int TRACK_STEP = 5;
+const int SEARCH_STEP = 5;
 
-const unsigned long TRACK_INTERVAL_MS = 45;
-const unsigned long SEARCH_INTERVAL_MS = 60;
-const unsigned long COMMAND_TIMEOUT_MS = 4000;
+const unsigned long TRACK_INTERVAL_MS = 80;
+const unsigned long SEARCH_INTERVAL_MS = 180;
+const unsigned long COMMAND_TIMEOUT_MS = 8000;
 
 const bool REVERSE_SERVO = true;
 

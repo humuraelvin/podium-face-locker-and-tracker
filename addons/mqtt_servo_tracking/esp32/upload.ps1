@@ -7,9 +7,26 @@ param(
 $ErrorActionPreference = "Stop"
 $SketchDir = Join-Path $PSScriptRoot "face_tracker"
 
-if (-not (Get-Command arduino-cli -ErrorAction SilentlyContinue)) {
-    throw "arduino-cli was not found in PATH. Install it first: https://arduino.github.io/arduino-cli/latest/installation/"
+function Resolve-ArduinoCli {
+    $cmd = Get-Command arduino-cli -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
+    }
+    $candidates = @(
+        "C:\Program Files\Arduino CLI\arduino-cli.exe",
+        "$env:LOCALAPPDATA\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe",
+        "$env:LOCALAPPDATA\Arduino CLI\arduino-cli.exe"
+    )
+    foreach ($path in $candidates) {
+        if (Test-Path $path) {
+            return $path
+        }
+    }
+    throw "arduino-cli was not found. Install from https://arduino.github.io/arduino-cli/latest/installation/ or add it to PATH."
 }
+
+$ArduinoCli = Resolve-ArduinoCli
+Write-Host "Using arduino-cli: $ArduinoCli"
 
 $LibDir = Join-Path $env:LOCALAPPDATA "Arduino15\libraries"
 $LibArgs = @(
@@ -18,9 +35,9 @@ $LibArgs = @(
 )
 
 Write-Host "Compiling $SketchDir for $Fqbn"
-arduino-cli compile --fqbn $Fqbn @LibArgs $SketchDir
+& $ArduinoCli compile --fqbn $Fqbn @LibArgs $SketchDir
 
 Write-Host "Uploading to $Port"
-arduino-cli upload -p $Port --fqbn $Fqbn $SketchDir
+& $ArduinoCli upload -p $Port --fqbn $Fqbn $SketchDir
 
 Write-Host "Done."

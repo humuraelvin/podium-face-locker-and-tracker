@@ -106,9 +106,9 @@ class FaceLock:
         # Detect head movement
         if self.last_position is not None:
             dx = center_x - self.last_position[0]
-            if dx > 10:  # Threshold for right movement
+            if dx > 30:  # Ignore small jitter from detection / servo motion
                 actions.append(Action(ActionType.HEAD_RIGHT, current_time, f"Moved right by {dx:.1f}px"))
-            elif dx < -10:  # Threshold for left movement
+            elif dx < -30:
                 actions.append(Action(ActionType.HEAD_LEFT, current_time, f"Moved left by {abs(dx):.1f}px"))
         
         # Detect eye blink (using vertical distance between eyes and nose)
@@ -647,6 +647,62 @@ def target_display_label(mr: MatchResult, target_name: str) -> str:
 def is_target_match(mr: MatchResult, target_name: str) -> bool:
     return mr.name == target_name and mr.accepted
 
+
+def lock_match_distance_limit(matcher: FaceDBMatcher, margin: float) -> float:
+    return float(matcher.dist_thresh + max(0.0, margin))
+
+
+def face_matches_lock(
+    emb: np.ndarray,
+    face_lock: FaceLock,
+    dist_limit: float,
+) -> Tuple[bool, float, float]:
+    dist = cosine_distance(emb, face_lock.target_emb)
+    sim = 1.0 - dist
+    return dist <= dist_limit, dist, sim
+
+
+def pick_locked_face_index(
+    faces: List[FaceDet],
+    face_lock: FaceLock,
+    dist_limit: float,
+    last_position: Optional[Tuple[float, float]],
+    spatial_lock_px: float,
+    face_embeddings: Dict[int, np.ndarray],
+) -> Optional[int]:
+    """Pick the detected face that best matches the locked embedding."""
+    best_index: Optional[int] = None
+    best_dist = float("inf")
+    for i, emb in face_embeddings.items():
+        if i >= len(faces):
+            continue
+        ok, dist, _ = face_matches_lock(emb, face_lock, dist_limit)
+        if ok and dist < best_dist:
+            best_dist = dist
+            best_index = i
+
+    if best_index is not None:
+        return best_index
+
+    if not faces or last_position is None:
+        return None
+
+    nearest_index: Optional[int] = None
+    nearest_dist = float("inf")
+    for i, face in enumerate(faces):
+        cx = float(face.kps[:, 0].mean())
+        cy = float(face.kps[:, 1].mean())
+        dist = float(np.hypot(cx - last_position[0], cy - last_position[1]))
+        if dist < nearest_dist:
+            nearest_dist = dist
+            nearest_index = i
+
+    if len(faces) == 1:
+        return 0
+    if nearest_index is not None and nearest_dist <= spatial_lock_px:
+        return nearest_index
+    return None
+
 # -------------------------
 # MQTT movement control
 # -------------------------
@@ -943,14 +999,44 @@ def parse_args() -> argparse.Namespace:
         "--scan-delay-sec",
         dest="scan_delay_sec",
         type=float,
-        default=0.8,
-        help="Delay before sending SCAN after the locked face is temporarily lost.",
+        default=3.0,
+        help="Delay before sending SCAN after the locked face is confirmed lost.",
     )
     parser.add_argument(
         "--reacquire-hold-sec",
         type=float,
-        default=0.30,
+        default=0.50,
         help="Short pause after SCAN finds the locked face again before tracking resumes.",
+    )
+    parser.add_argument(
+        "--lock-lost-frames",
+        type=int,
+        default=18,
+        help="Consecutive frames without a locked face before treating target as lost.",
+    )
+    parser.add_argument(
+        "--lock-settle-sec",
+        type=float,
+        default=2.0,
+        help="After locking, hold still this long before servo tracking adjusts.",
+    )
+    parser.add_argument(
+        "--lock-match-margin",
+        type=float,
+        default=0.15,
+        help="Extra cosine-distance margin when matching the locked embedding.",
+    )
+    parser.add_argument(
+        "--spatial-lock-px",
+        type=float,
+        default=140.0,
+        help="Fallback: keep lock on nearest face within this many pixels of last position.",
+    )
+    parser.add_argument(
+        "--found-center-px",
+        type=float,
+        default=55.0,
+        help="After SCAN reacquires the target, keep tracking until the face is within this many pixels of center before announcing 'found, stop'.",
     )
     parser.add_argument(
         "--mqtt-min-interval",
@@ -1129,6 +1215,11 @@ def main():
     args.error_smooth_alpha = float(max(0.01, min(1.0, args.error_smooth_alpha)))
     args.command_confirm_frames = int(max(1, args.command_confirm_frames))
     args.scan_delay_sec = float(max(0.0, args.scan_delay_sec))
+    args.lock_lost_frames = int(max(1, args.lock_lost_frames))
+    args.lock_settle_sec = float(max(0.0, args.lock_settle_sec))
+    args.lock_match_margin = float(max(0.0, args.lock_match_margin))
+    args.spatial_lock_px = float(max(20.0, args.spatial_lock_px))
+    args.found_center_px = float(max(10.0, args.found_center_px))
     args.reacquire_hold_sec = float(max(0.0, args.reacquire_hold_sec))
     args.evidence_log_interval_sec = float(max(0.0, args.evidence_log_interval_sec))
     args.mqtt_min_interval = float(max(0.0, args.mqtt_min_interval))
@@ -1260,8 +1351,12 @@ def main():
     pending_track_command: Optional[str] = None
     pending_track_count = 0
     face_missing_since: Optional[float] = None
+    lock_miss_streak = 0
+    lock_settle_until = 0.0
+    face_lost_logged = False
     reacquire_hold_until = 0.0
     scan_started_logged = False
+    centering_after_scan = False
     alert_message = ""
     alert_until = 0.0
     overlay_log = OverlayEventLog()
@@ -1380,6 +1475,10 @@ def main():
                 face_missing_since = None
                 reacquire_hold_until = 0.0
                 scan_started_logged = False
+                lock_miss_streak = 0
+                lock_settle_until = 0.0
+                face_lost_logged = False
+                centering_after_scan = False
                 if mqtt_publisher is not None:
                     mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
             
@@ -1393,8 +1492,14 @@ def main():
             locked_face_found = False
             locked_face_kps: Optional[np.ndarray] = None
             locked_face_bbox: Optional[List[int]] = None
+            locked_face_index: Optional[int] = None
             target_match: Optional[MatchResult] = None
             frame_match_records: List[Dict[str, object]] = []
+            recognize_every = 1 if face_lock else args.recognize_every
+            lock_dist_limit = (
+                lock_match_distance_limit(matcher, args.lock_match_margin) if face_lock else 0.0
+            )
+            frame_face_embeddings: Dict[int, np.ndarray] = {}
             
             for i, f in enumerate(faces):
                 cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
@@ -1413,19 +1518,28 @@ def main():
                     matcher=matcher,
                     smoothing_window=smoothing_window,
                     label_smoothing_window=label_smoothing_window,
-                    recognize_every=args.recognize_every,
+                    recognize_every=recognize_every,
                     target_name=args.target_name,
                 )
                 if recognized_now:
                     last_profile["recognize"] += (time.perf_counter() - recognize_started_at) * 1000.0
 
+                if cache.emb is not None:
+                    frame_face_embeddings[i] = cache.emb
+
                 if mr.name == args.target_name and mr.accepted:
                     if target_match is None or mr.similarity > target_match.similarity:
                         target_match = mr
                 
-                # Check if this is our locked face
+                # Check if this is our locked face (embedding match, not just DB label)
                 is_locked_face = False
-                if face_lock and mr.name == face_lock.target_name and mr.accepted:
+                if face_lock and cache.emb is not None:
+                    ok, _, _ = face_matches_lock(cache.emb, face_lock, lock_dist_limit)
+                    is_locked_face = ok
+                elif face_lock and mr.name == face_lock.target_name and mr.accepted:
+                    is_locked_face = True
+
+                if is_locked_face:
                     # Update face lock with new position and detect actions
                     actions = []
                     for action in face_lock.update_position(f.kps):
@@ -1435,7 +1549,7 @@ def main():
                             last_action_print_at[action.type] = current_time
                     face_lock.history.extend(actions)
                     log_face_actions(action_logger, face_lock.target_name, actions)
-                    is_locked_face = True
+                    locked_face_index = i
                     locked_face_found = True
                     locked_face_kps = f.kps.copy()
                     locked_face_bbox = [int(f.x1), int(f.y1), int(f.x2), int(f.y2)]
@@ -1526,8 +1640,34 @@ def main():
                     dbg = f"kpsLeye=({f.kps[0,0]:.0f},{f.kps[0,1]:.0f})"
                     draw_text_with_shadow(vis, dbg, (10, h - 20), 0.65, (255, 255, 255), 1, font=cv2.FONT_HERSHEY_DUPLEX)
 
+            if face_lock and not locked_face_found:
+                fallback_index = pick_locked_face_index(
+                    faces=faces,
+                    face_lock=face_lock,
+                    dist_limit=lock_dist_limit,
+                    last_position=face_lock.last_position,
+                    spatial_lock_px=args.spatial_lock_px,
+                    face_embeddings=frame_face_embeddings,
+                )
+                if fallback_index is not None and fallback_index < len(faces):
+                    f = faces[fallback_index]
+                    actions = []
+                    for action in face_lock.update_position(f.kps):
+                        last_at = last_action_print_at.get(action.type, 0.0)
+                        if current_time - last_at >= 0.7:
+                            actions.append(action)
+                            last_action_print_at[action.type] = current_time
+                    face_lock.history.extend(actions)
+                    log_face_actions(action_logger, face_lock.target_name, actions)
+                    locked_face_index = fallback_index
+                    locked_face_found = True
+                    locked_face_kps = f.kps.copy()
+                    locked_face_bbox = [int(f.x1), int(f.y1), int(f.x2), int(f.y2)]
+
             # Movement command for ESP servo
             if face_lock and locked_face_found and locked_face_kps is not None:
+                lock_miss_streak = 0
+                face_lost_logged = False
                 was_missing = face_missing_since is not None
                 was_scanning = (
                     was_missing
@@ -1537,10 +1677,9 @@ def main():
                     detail = "Target face reacquired"
                     if was_scanning:
                         detail += " after SCAN"
-                        alert_message = f"{args.target_name} found, stop!"
-                        alert_until = current_time + 4.0
-                        overlay_log.add("search", "FOUND", alert_message)
-                        print(f"[Search] {alert_message}")
+                        # Don't announce "found" yet: keep tracking until the
+                        # camera is actually centered on the target.
+                        centering_after_scan = True
                     reacquired_action = Action(ActionType.FACE_REACQUIRED, current_time, detail)
                     face_lock.history.append(reacquired_action)
                     log_face_actions(action_logger, face_lock.target_name, [reacquired_action])
@@ -1550,11 +1689,11 @@ def main():
                 raw_movement_error_x = float(raw_error_x)
 
                 if was_scanning:
+                    # Reset smoothing so tracking responds to the freshly found face.
                     filtered_error_x = raw_error_x
                     stable_track_command = MOVEMENT_CENTER
                     pending_track_command = None
                     pending_track_count = 0
-                    reacquire_hold_until = current_time + args.reacquire_hold_sec
 
                 if filtered_error_x is None:
                     filtered_error_x = raw_error_x
@@ -1568,6 +1707,30 @@ def main():
 
                 if current_time < reacquire_hold_until:
                     movement_command = MOVEMENT_IDLE
+                elif current_time < lock_settle_until:
+                    movement_command = MOVEMENT_IDLE
+                    tracking_zone = "SETTLING"
+                elif centering_after_scan:
+                    # Reacquired during a scan: drive toward center, only stop
+                    # and announce once the face is truly in the middle.
+                    if abs(movement_error_x) <= args.found_center_px:
+                        centering_after_scan = False
+                        stable_track_command = MOVEMENT_CENTER
+                        pending_track_command = None
+                        pending_track_count = 0
+                        reacquire_hold_until = current_time + args.reacquire_hold_sec
+                        movement_command = MOVEMENT_IDLE
+                        tracking_zone = "CENTER"
+                        alert_message = f"{args.target_name} found, stop!"
+                        alert_until = current_time + 4.0
+                        overlay_log.add("search", "FOUND", alert_message)
+                        print(f"[Search] {alert_message}")
+                    else:
+                        stable_track_command = (
+                            MOVEMENT_RIGHT if movement_error_x > 0 else MOVEMENT_LEFT
+                        )
+                        movement_command = stable_track_command
+                        tracking_zone = "CENTERING"
                 else:
                     reacquire_hold_until = 0.0
                     desired_track_command = command_from_error_with_hysteresis(
@@ -1593,28 +1756,47 @@ def main():
 
                     movement_command = stable_track_command
             elif face_lock:
-                if face_missing_since is None:
-                    face_missing_since = current_time
-                    lost_action = Action(ActionType.FACE_LOST, current_time, "Target face out of frame or occluded")
-                    face_lock.history.append(lost_action)
-                    log_face_actions(action_logger, face_lock.target_name, [lost_action])
-                lost_for = current_time - face_missing_since
-                if lost_for < args.scan_delay_sec:
+                lock_miss_streak += 1
+                if lock_miss_streak < args.lock_lost_frames:
                     movement_command = MOVEMENT_IDLE
+                    movement_error_x = 0.0
+                    raw_movement_error_x = 0.0
+                    tracking_zone = "HOLD"
+                    pending_track_command = None
+                    pending_track_count = 0
                 else:
-                    movement_command = MOVEMENT_SCAN
-                    if not scan_started_logged:
-                        scan_action = Action(ActionType.SCAN_STARTED, current_time, "Started SCAN to reacquire target")
-                        face_lock.history.append(scan_action)
-                        scan_started_logged = True
-                        scan_msg = f"SEARCHING for {args.target_name}..."
-                        overlay_log.add("search", "SCAN", scan_msg)
-                        log_face_actions(action_logger, face_lock.target_name, [scan_action])
-                pending_track_command = None
-                pending_track_count = 0
-                movement_error_x = 0.0
-                raw_movement_error_x = 0.0
-                tracking_zone = "MISSING"
+                    if face_missing_since is None:
+                        face_missing_since = current_time
+                    if not face_lost_logged:
+                        lost_action = Action(
+                            ActionType.FACE_LOST,
+                            current_time,
+                            "Target face out of frame or occluded",
+                        )
+                        face_lock.history.append(lost_action)
+                        log_face_actions(action_logger, face_lock.target_name, [lost_action])
+                        face_lost_logged = True
+                    lost_for = current_time - face_missing_since
+                    if lost_for < args.scan_delay_sec:
+                        movement_command = MOVEMENT_IDLE
+                    else:
+                        movement_command = MOVEMENT_SCAN
+                        if not scan_started_logged:
+                            scan_action = Action(
+                                ActionType.SCAN_STARTED,
+                                current_time,
+                                "Started SCAN to reacquire target",
+                            )
+                            face_lock.history.append(scan_action)
+                            scan_started_logged = True
+                            scan_msg = f"SEARCHING for {args.target_name}..."
+                            overlay_log.add("search", "SCAN", scan_msg)
+                            log_face_actions(action_logger, face_lock.target_name, [scan_action])
+                    pending_track_command = None
+                    pending_track_count = 0
+                    movement_error_x = 0.0
+                    raw_movement_error_x = 0.0
+                    tracking_zone = "MISSING"
             else:
                 filtered_error_x = None
                 stable_track_command = MOVEMENT_CENTER
@@ -1623,6 +1805,10 @@ def main():
                 face_missing_since = None
                 reacquire_hold_until = 0.0
                 scan_started_logged = False
+                lock_miss_streak = 0
+                lock_settle_until = 0.0
+                face_lost_logged = False
+                centering_after_scan = False
                 movement_command = MOVEMENT_IDLE
                 movement_error_x = 0.0
                 raw_movement_error_x = 0.0
@@ -1910,6 +2096,10 @@ def main():
                     face_missing_since = None
                     reacquire_hold_until = 0.0
                     scan_started_logged = False
+                    lock_miss_streak = 0
+                    lock_settle_until = 0.0
+                    face_lost_logged = False
+                    centering_after_scan = False
                     if mqtt_publisher is not None:
                         mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
                 # Only allow locking if we have a selected recognized face
@@ -1937,6 +2127,10 @@ def main():
                     face_missing_since = None
                     reacquire_hold_until = 0.0
                     scan_started_logged = False
+                    lock_miss_streak = 0
+                    lock_settle_until = current_time + args.lock_settle_sec
+                    face_lost_logged = False
+                    centering_after_scan = False
                     print(f"[FaceLock] Locked onto {name} (face {selected_face_index + 1 if selected_face_index is not None else '?'})")
                     # Keep selection for visual feedback, but locking is done
     finally:
