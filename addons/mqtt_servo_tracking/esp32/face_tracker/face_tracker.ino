@@ -24,13 +24,18 @@ const uint8_t SERVO_PIN = 18; // Recommended ESP32 pin
 const int SERVO_MIN_ANGLE = 0;
 const int SERVO_MAX_ANGLE = 180;
 const int SERVO_CENTER_ANGLE = 90;
+const int SERVO_MIN_PULSE_US = 500;
+const int SERVO_MAX_PULSE_US = 2400;
 
-const int TRACK_STEP = 5;
-const int SEARCH_STEP = 5;
+// Smooth, small steps at high frequency (proven motion model): tiny moves
+// every few ms give fluid tracking with minimal overshoot so the servo can
+// stop exactly on the target the instant CENTER/IDLE is received.
+const float TRACK_STEP = 0.55f;
+const float SEARCH_STEP = 0.50f;
 
-const unsigned long TRACK_INTERVAL_MS = 80;
-const unsigned long SEARCH_INTERVAL_MS = 180;
-const unsigned long COMMAND_TIMEOUT_MS = 8000;
+const unsigned long TRACK_INTERVAL_MS = 14;
+const unsigned long SEARCH_INTERVAL_MS = 24;
+const unsigned long COMMAND_TIMEOUT_MS = 800;
 
 const bool REVERSE_SERVO = true;
 
@@ -42,6 +47,7 @@ enum MovementCommand {
   CMD_LEFT,
   CMD_RIGHT,
   CMD_CENTER,
+  CMD_HOME,
   CMD_SEARCH
 };
 
@@ -57,7 +63,7 @@ Servo panServo;
 // =========================
 MovementCommand currentCommand = CMD_IDLE;
 
-int servoAngle = SERVO_CENTER_ANGLE;
+float servoAngle = SERVO_CENTER_ANGLE;
 int sweepDirection = 1;
 
 unsigned long lastMoveAt = 0;
@@ -68,11 +74,25 @@ unsigned long lastCommandAt = 0;
 // Servo Functions
 // ======================================================
 
-void setServoAngle(int angle) {
-  angle = constrain(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+int angleToPulse(float angle) {
+  float normalized =
+      (angle - SERVO_MIN_ANGLE) /
+      float(SERVO_MAX_ANGLE - SERVO_MIN_ANGLE);
+
+  return SERVO_MIN_PULSE_US +
+      int((normalized * (SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US)) + 0.5f);
+}
+
+void setServoAngle(float angle) {
+  if (angle < SERVO_MIN_ANGLE) {
+    angle = SERVO_MIN_ANGLE;
+  }
+  if (angle > SERVO_MAX_ANGLE) {
+    angle = SERVO_MAX_ANGLE;
+  }
 
   servoAngle = angle;
-  panServo.write(servoAngle);
+  panServo.writeMicroseconds(angleToPulse(servoAngle));
 }
 
 void applyTrackingStep(int logicalDirection) {
@@ -109,6 +129,10 @@ MovementCommand parseCommand(String message) {
 
   if (message == "CENTER") {
     return CMD_CENTER;
+  }
+
+  if (message == "HOME") {
+    return CMD_HOME;
   }
 
   // Python tracker publishes SCAN; accept both names.
@@ -273,9 +297,18 @@ void handleServo() {
   }
 
   // ----------------------
-  // CENTER
+  // CENTER / IDLE both mean: the target is centered (or no command) so HOLD
+  // the current servo angle. This is what makes the servo stop exactly on the
+  // person instead of snapping back to the middle.
   // ----------------------
-  if (currentCommand == CMD_CENTER) {
+  if (currentCommand == CMD_CENTER || currentCommand == CMD_IDLE) {
+    return;
+  }
+
+  // ----------------------
+  // HOME: explicit recenter to the physical middle.
+  // ----------------------
+  if (currentCommand == CMD_HOME) {
 
     setServoAngle(SERVO_CENTER_ANGLE);
 
