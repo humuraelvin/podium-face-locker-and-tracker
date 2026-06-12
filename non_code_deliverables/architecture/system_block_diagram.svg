@@ -1,48 +1,86 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680">
-  <rect width="1200" height="680" fill="#ffffff"/>
-  <text x="30" y="40" font-size="28" font-family="Arial">AI-Powered Podium Face-Tracking System - Block Diagram</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="700" viewBox="0 0 1240 700">
+  <rect width="1240" height="700" fill="#ffffff"/>
+  <text x="30" y="42" font-size="26" font-family="Arial" font-weight="bold">BENAX Single-Speaker Face-Tracking System - Block Diagram</text>
+  <text x="30" y="66" font-size="14" font-family="Arial" fill="#555">Target speaker: Elvin  |  MQTT broker 157.173.101.159:1883</text>
 
-  <rect x="40" y="90" width="250" height="120" fill="#e8f4ff" stroke="#1f3b5c" stroke-width="2"/>
-  <text x="60" y="135" font-size="20" font-family="Arial">USB Camera</text>
-  <text x="60" y="165" font-size="16" font-family="Arial">Live Frame Source</text>
+  <!-- Camera -->
+  <rect x="40" y="100" width="240" height="120" fill="#e8f4ff" stroke="#1f3b5c" stroke-width="2"/>
+  <text x="60" y="140" font-size="19" font-family="Arial" font-weight="bold">USB Camera</text>
+  <text x="60" y="168" font-size="14" font-family="Arial">Live frames (index 0)</text>
+  <text x="60" y="190" font-size="14" font-family="Arial">~800x600 @ 30 fps</text>
 
-  <rect x="360" y="70" width="340" height="170" fill="#edfced" stroke="#1d4f2b" stroke-width="2"/>
-  <text x="380" y="105" font-size="18" font-family="Arial">PC AI Pipeline (Python 3.11)</text>
-  <text x="380" y="135" font-size="15" font-family="Arial">Face Detect + Recognition</text>
-  <text x="380" y="160" font-size="15" font-family="Arial">Single-Speaker Lock + Tracking</text>
-  <text x="380" y="185" font-size="15" font-family="Arial">Control + MQTT Publisher + Logger</text>
+  <!-- PC AI Pipeline -->
+  <rect x="340" y="80" width="360" height="200" fill="#edfced" stroke="#1d4f2b" stroke-width="2"/>
+  <text x="360" y="112" font-size="18" font-family="Arial" font-weight="bold">PC AI Pipeline (Python 3.11)</text>
+  <text x="360" y="140" font-size="14" font-family="Arial">Haar + FaceMesh 5-pt detection</text>
+  <text x="360" y="163" font-size="14" font-family="Arial">ArcFace ONNX embedding + cosine match</text>
+  <text x="360" y="186" font-size="14" font-family="Arial">Single-speaker lock (embedding)</text>
+  <text x="360" y="209" font-size="14" font-family="Arial">Tracking + directional search + centering</text>
+  <text x="360" y="232" font-size="14" font-family="Arial">MQTT publisher + evidence/history logger</text>
+  <text x="360" y="258" font-size="13" font-family="Arial" fill="#555">recognize_mqtt.py</text>
 
-  <rect x="760" y="110" width="190" height="90" fill="#fff9e6" stroke="#6b5b00" stroke-width="2"/>
-  <text x="785" y="155" font-size="18" font-family="Arial">MQTT Broker</text>
+  <!-- MQTT Broker -->
+  <rect x="760" y="120" width="200" height="100" fill="#fff9e6" stroke="#6b5b00" stroke-width="2"/>
+  <text x="785" y="158" font-size="18" font-family="Arial" font-weight="bold">MQTT Broker</text>
+  <text x="778" y="183" font-size="13" font-family="Arial">157.173.101.159:1883</text>
+  <text x="778" y="204" font-size="12" font-family="Arial" fill="#555">vision/elvin/movement + status</text>
 
-  <rect x="980" y="70" width="190" height="170" fill="#f4ecff" stroke="#4b2f72" stroke-width="2"/>
-  <text x="995" y="105" font-size="17" font-family="Arial">Wemos D1 Mini</text>
-  <text x="995" y="130" font-size="15" font-family="Arial">ESP8266 Subscriber</text>
-  <text x="995" y="155" font-size="15" font-family="Arial">DIR/STEP Generator</text>
-  <text x="995" y="180" font-size="15" font-family="Arial">Safety Timeout Stop</text>
+  <!-- ESP32 -->
+  <rect x="1010" y="80" width="200" height="200" fill="#f4ecff" stroke="#4b2f72" stroke-width="2"/>
+  <text x="1028" y="112" font-size="17" font-family="Arial" font-weight="bold">ESP32 DevKit</text>
+  <text x="1028" y="140" font-size="14" font-family="Arial">MQTT subscriber</text>
+  <text x="1028" y="163" font-size="14" font-family="Arial">Command parser:</text>
+  <text x="1028" y="184" font-size="13" font-family="Arial">LEFT/RIGHT/CENTER</text>
+  <text x="1028" y="203" font-size="13" font-family="Arial">SCAN/IDLE/HOME</text>
+  <text x="1028" y="226" font-size="14" font-family="Arial">CENTER/IDLE = hold</text>
+  <text x="1028" y="249" font-size="14" font-family="Arial">0.8s safety timeout</text>
+  <text x="1028" y="272" font-size="13" font-family="Arial" fill="#555">PWM servo on GPIO18</text>
 
-  <rect x="980" y="290" width="190" height="110" fill="#ffeef0" stroke="#7a1f28" stroke-width="2"/>
-  <text x="1010" y="330" font-size="18" font-family="Arial">A4988 Driver</text>
-  <text x="995" y="355" font-size="15" font-family="Arial">DIR=D5, STEP=D6</text>
+  <!-- Servo -->
+  <rect x="1010" y="430" width="200" height="120" fill="#eef9ff" stroke="#204a63" stroke-width="2"/>
+  <text x="1052" y="470" font-size="18" font-family="Arial" font-weight="bold">Pan Servo</text>
+  <text x="1028" y="497" font-size="14" font-family="Arial">0-180 deg, boot rest 0 deg</text>
+  <text x="1028" y="520" font-size="14" font-family="Arial">Smooth micro-steps</text>
+  <text x="1028" y="540" font-size="13" font-family="Arial" fill="#555">writeMicroseconds (500-2400us)</text>
 
-  <rect x="980" y="450" width="190" height="110" fill="#eef9ff" stroke="#204a63" stroke-width="2"/>
-  <text x="1020" y="492" font-size="18" font-family="Arial">NEMA17</text>
-  <text x="1010" y="517" font-size="15" font-family="Arial">Pan Rotation</text>
+  <!-- Dashboard -->
+  <rect x="340" y="360" width="360" height="120" fill="#fdeefe" stroke="#6b2f6b" stroke-width="2"/>
+  <text x="360" y="396" font-size="18" font-family="Arial" font-weight="bold">Web Dashboard</text>
+  <text x="360" y="423" font-size="14" font-family="Arial">WebSocket (MQTT over WS)</text>
+  <text x="360" y="446" font-size="14" font-family="Arial">Live status: lock, movement, search alert</text>
+  <text x="360" y="469" font-size="13" font-family="Arial" fill="#555">dashboard/index.html</text>
 
-  <rect x="330" y="300" width="370" height="210" fill="#f7f7f7" stroke="#333333" stroke-width="2"/>
-  <text x="350" y="335" font-size="18" font-family="Arial">Power Subsystem</text>
-  <text x="350" y="365" font-size="15" font-family="Arial">12V Supply - Primary Source</text>
-  <text x="350" y="390" font-size="15" font-family="Arial">12V - VMOT (A4988 motor power)</text>
-  <text x="350" y="415" font-size="15" font-family="Arial">Buck Converter - 5V to ESP8266</text>
-  <text x="350" y="440" font-size="15" font-family="Arial">Regulated 3.3V - A4988 VDD</text>
-  <text x="350" y="465" font-size="15" font-family="Arial">Common GND + 100uF at VMOT/GND</text>
+  <!-- Power -->
+  <rect x="40" y="360" width="250" height="120" fill="#f7f7f7" stroke="#333333" stroke-width="2"/>
+  <text x="60" y="396" font-size="18" font-family="Arial" font-weight="bold">Power</text>
+  <text x="60" y="423" font-size="14" font-family="Arial">USB 5V to ESP32</text>
+  <text x="60" y="446" font-size="14" font-family="Arial">5V / GND to servo</text>
+  <text x="60" y="469" font-size="13" font-family="Arial" fill="#555">Common ground</text>
 
-  <line x1="290" y1="150" x2="360" y2="150" stroke="#000" stroke-width="3"/>
-  <line x1="700" y1="150" x2="760" y2="150" stroke="#000" stroke-width="3"/>
-  <line x1="950" y1="150" x2="980" y2="150" stroke="#000" stroke-width="3"/>
-  <line x1="1075" y1="240" x2="1075" y2="290" stroke="#000" stroke-width="3"/>
-  <line x1="1075" y1="400" x2="1075" y2="450" stroke="#000" stroke-width="3"/>
+  <!-- Flows -->
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#000"/>
+    </marker>
+  </defs>
 
-  <line x1="700" y1="400" x2="980" y2="350" stroke="#666" stroke-width="2" stroke-dasharray="8 6"/>
-  <line x1="700" y1="430" x2="980" y2="500" stroke="#666" stroke-width="2" stroke-dasharray="8 6"/>
+  <line x1="280" y1="160" x2="338" y2="160" stroke="#000" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="285" y="150" font-size="12" font-family="Arial">frames</text>
+
+  <line x1="700" y1="170" x2="758" y2="170" stroke="#000" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="702" y="160" font-size="12" font-family="Arial">commands</text>
+
+  <line x1="960" y1="160" x2="1008" y2="160" stroke="#000" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="958" y="150" font-size="12" font-family="Arial">subscribe</text>
+
+  <line x1="1110" y1="280" x2="1110" y2="428" stroke="#000" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="1118" y="360" font-size="12" font-family="Arial">PWM</text>
+
+  <!-- status to dashboard -->
+  <line x1="820" y1="220" x2="560" y2="358" stroke="#666" stroke-width="2" stroke-dasharray="8 6" marker-end="url(#arrow)"/>
+  <text x="640" y="300" font-size="12" font-family="Arial" fill="#666">status (WS)</text>
+
+  <!-- power to esp32 -->
+  <line x1="290" y1="420" x2="1008" y2="250" stroke="#999" stroke-width="2" stroke-dasharray="4 5"/>
+  <text x="640" y="392" font-size="12" font-family="Arial" fill="#999">5V power</text>
 </svg>

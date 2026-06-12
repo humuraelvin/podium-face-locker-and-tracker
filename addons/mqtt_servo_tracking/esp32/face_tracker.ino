@@ -63,7 +63,7 @@ Servo panServo;
 // =========================
 MovementCommand currentCommand = CMD_IDLE;
 
-float servoAngle = SERVO_CENTER_ANGLE;
+float servoAngle = SERVO_MIN_ANGLE;
 int sweepDirection = 1;
 
 unsigned long lastMoveAt = 0;
@@ -385,8 +385,8 @@ void runBootServoTest() {
     setServoAngle(angle);
     delay(40);
   }
-  setServoAngle(SERVO_CENTER_ANGLE);
-  Serial.println("[TEST] Boot servo sweep done.");
+  setServoAngle(SERVO_MIN_ANGLE);
+  Serial.println("[TEST] Boot servo sweep done. Resting at 0 degrees.");
 }
 
 void setup() {
@@ -416,7 +416,7 @@ void setup() {
       2400
   );
 
-  setServoAngle(SERVO_CENTER_ANGLE);
+  setServoAngle(SERVO_MIN_ANGLE);
   runBootServoTest();
 
   // ----------------------
