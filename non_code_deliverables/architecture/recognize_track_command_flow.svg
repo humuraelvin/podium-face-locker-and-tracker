@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700">
+  <rect width="1200" height="700" fill="#ffffff"/>
+  <text x="30" y="40" font-size="28" font-family="Arial">Recognize - Track - Command Flow</text>
+
+  <rect x="70" y="90" width="250" height="70" fill="#e8f4ff" stroke="#1f3b5c" stroke-width="2"/>
+  <text x="110" y="135" font-size="18" font-family="Arial">Capture Frame</text>
+
+  <rect x="390" y="90" width="280" height="70" fill="#edfced" stroke="#1d4f2b" stroke-width="2"/>
+  <text x="450" y="135" font-size="18" font-family="Arial">Detect Faces</text>
+
+  <rect x="760" y="90" width="340" height="70" fill="#fff9e6" stroke="#6b5b00" stroke-width="2"/>
+  <text x="790" y="135" font-size="18" font-family="Arial">Compute Embeddings + Compare</text>
+
+  <polygon points="580,240 700,300 580,360 460,300" fill="#f4ecff" stroke="#4b2f72" stroke-width="2"/>
+  <text x="500" y="305" font-size="17" font-family="Arial">Speaker Match?</text>
+
+  <rect x="120" y="450" width="330" height="90" fill="#ffeef0" stroke="#7a1f28" stroke-width="2"/>
+  <text x="145" y="490" font-size="17" font-family="Arial">Ignore Face / STOP or Scan</text>
+  <text x="145" y="515" font-size="14" font-family="Arial">No-match and no-face handling</text>
+
+  <rect x="760" y="450" width="330" height="90" fill="#eef9ff" stroke="#204a63" stroke-width="2"/>
+  <text x="805" y="490" font-size="17" font-family="Arial">Speaker Lock + Tracking</text>
+  <text x="805" y="515" font-size="14" font-family="Arial">Error, deadband, smoothing</text>
+
+  <rect x="760" y="600" width="330" height="70" fill="#f7f7f7" stroke="#333333" stroke-width="2"/>
+  <text x="810" y="642" font-size="17" font-family="Arial">Publish MQTT Command</text>
+
+  <line x1="320" y1="125" x2="390" y2="125" stroke="#000" stroke-width="3"/>
+  <line x1="670" y1="125" x2="760" y2="125" stroke="#000" stroke-width="3"/>
+  <line x1="930" y1="160" x2="700" y2="280" stroke="#000" stroke-width="3"/>
+  <line x1="580" y1="360" x2="580" y2="445" stroke="#000" stroke-width="3"/>
+  <line x1="700" y1="300" x2="760" y2="490" stroke="#000" stroke-width="3"/>
+  <line x1="925" y1="540" x2="925" y2="600" stroke="#000" stroke-width="3"/>
+
+  <text x="720" y="250" font-size="16" font-family="Arial">Yes</text>
+  <text x="585" y="420" font-size="16" font-family="Arial">No</text>
+</svg>

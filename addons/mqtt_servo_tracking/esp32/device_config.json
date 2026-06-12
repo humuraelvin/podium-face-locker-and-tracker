@@ -1,0 +1,25 @@
+{
+  "target_name": "Elvin",
+  "wifi": {
+    "ssid": "Peace And Love Ploclaimers",
+    "password": "loveisthekey"
+  },
+  "pc": {
+    "wifi_ip": "10.12.75.242",
+    "ethernet_ip": "10.12.74.133",
+    "gateway": "10.12.72.1",
+    "subnet": "255.255.252.0"
+  },
+  "mqtt": {
+    "broker": "157.173.101.159",
+    "port": 1883,
+    "movement_topic": "vision/elvin/movement",
+    "status_topic": "vision/elvin/status",
+    "client_id_prefix": "elvin-face-servo"
+  },
+  "esp32": {
+    "serial_port": "COM6",
+    "servo_pin": 18,
+    "fqbn": "esp32:esp32:esp32"
+  }
+}

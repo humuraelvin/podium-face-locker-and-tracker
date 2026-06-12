@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680">
+  <rect width="1200" height="680" fill="#ffffff"/>
+  <text x="30" y="40" font-size="28" font-family="Arial">AI-Powered Podium Face-Tracking System - Block Diagram</text>
+
+  <rect x="40" y="90" width="250" height="120" fill="#e8f4ff" stroke="#1f3b5c" stroke-width="2"/>
+  <text x="60" y="135" font-size="20" font-family="Arial">USB Camera</text>
+  <text x="60" y="165" font-size="16" font-family="Arial">Live Frame Source</text>
+
+  <rect x="360" y="70" width="340" height="170" fill="#edfced" stroke="#1d4f2b" stroke-width="2"/>
+  <text x="380" y="105" font-size="18" font-family="Arial">PC AI Pipeline (Python 3.11)</text>
+  <text x="380" y="135" font-size="15" font-family="Arial">Face Detect + Recognition</text>
+  <text x="380" y="160" font-size="15" font-family="Arial">Single-Speaker Lock + Tracking</text>
+  <text x="380" y="185" font-size="15" font-family="Arial">Control + MQTT Publisher + Logger</text>
+
+  <rect x="760" y="110" width="190" height="90" fill="#fff9e6" stroke="#6b5b00" stroke-width="2"/>
+  <text x="785" y="155" font-size="18" font-family="Arial">MQTT Broker</text>
+
+  <rect x="980" y="70" width="190" height="170" fill="#f4ecff" stroke="#4b2f72" stroke-width="2"/>
+  <text x="995" y="105" font-size="17" font-family="Arial">Wemos D1 Mini</text>
+  <text x="995" y="130" font-size="15" font-family="Arial">ESP8266 Subscriber</text>
+  <text x="995" y="155" font-size="15" font-family="Arial">DIR/STEP Generator</text>
+  <text x="995" y="180" font-size="15" font-family="Arial">Safety Timeout Stop</text>
+
+  <rect x="980" y="290" width="190" height="110" fill="#ffeef0" stroke="#7a1f28" stroke-width="2"/>
+  <text x="1010" y="330" font-size="18" font-family="Arial">A4988 Driver</text>
+  <text x="995" y="355" font-size="15" font-family="Arial">DIR=D5, STEP=D6</text>
+
+  <rect x="980" y="450" width="190" height="110" fill="#eef9ff" stroke="#204a63" stroke-width="2"/>
+  <text x="1020" y="492" font-size="18" font-family="Arial">NEMA17</text>
+  <text x="1010" y="517" font-size="15" font-family="Arial">Pan Rotation</text>
+
+  <rect x="330" y="300" width="370" height="210" fill="#f7f7f7" stroke="#333333" stroke-width="2"/>
+  <text x="350" y="335" font-size="18" font-family="Arial">Power Subsystem</text>
+  <text x="350" y="365" font-size="15" font-family="Arial">12V Supply - Primary Source</text>
+  <text x="350" y="390" font-size="15" font-family="Arial">12V - VMOT (A4988 motor power)</text>
+  <text x="350" y="415" font-size="15" font-family="Arial">Buck Converter - 5V to ESP8266</text>
+  <text x="350" y="440" font-size="15" font-family="Arial">Regulated 3.3V - A4988 VDD</text>
+  <text x="350" y="465" font-size="15" font-family="Arial">Common GND + 100uF at VMOT/GND</text>
+
+  <line x1="290" y1="150" x2="360" y2="150" stroke="#000" stroke-width="3"/>
+  <line x1="700" y1="150" x2="760" y2="150" stroke="#000" stroke-width="3"/>
+  <line x1="950" y1="150" x2="980" y2="150" stroke="#000" stroke-width="3"/>
+  <line x1="1075" y1="240" x2="1075" y2="290" stroke="#000" stroke-width="3"/>
+  <line x1="1075" y1="400" x2="1075" y2="450" stroke="#000" stroke-width="3"/>
+
+  <line x1="700" y1="400" x2="980" y2="350" stroke="#666" stroke-width="2" stroke-dasharray="8 6"/>
+  <line x1="700" y1="430" x2="980" y2="500" stroke="#666" stroke-width="2" stroke-dasharray="8 6"/>
+</svg>
