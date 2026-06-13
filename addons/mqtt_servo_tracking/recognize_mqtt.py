@@ -23,6 +23,7 @@ import json
 import time
 import os
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
@@ -709,7 +710,8 @@ def pick_locked_face_index(
 MOVEMENT_LEFT = "LEFT"
 MOVEMENT_RIGHT = "RIGHT"
 MOVEMENT_CENTER = "CENTER"
-MOVEMENT_SCAN = "SCAN"
+MOVEMENT_SEARCH = "SEARCH"
+MOVEMENT_SCAN = MOVEMENT_SEARCH  # dashboard / legacy alias
 MOVEMENT_IDLE = "IDLE"
 DEFAULT_MQTT_BROKER = "157.173.101.159"
 DEFAULT_MOVEMENT_TOPIC = "vision/elvin/movement"
@@ -820,15 +822,19 @@ class MqttMovementPublisher:
         client_id: str,
         min_publish_interval: float = 0.15,
         status_min_publish_interval: float = 0.25,
+        heartbeat_interval: float = 0.2,
     ):
         self.topic = topic
         self.status_topic = status_topic
         self.min_publish_interval = float(max(0.0, min_publish_interval))
         self.status_min_publish_interval = float(max(0.0, status_min_publish_interval))
+        self.heartbeat_interval = float(max(0.0, heartbeat_interval))
         self.last_command: Optional[str] = None
         self.last_publish_at = 0.0
         self.last_status_publish_at = 0.0
         self.connected = False
+        self._stop_event = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
 
         if mqtt is None:
             raise RuntimeError("paho-mqtt is not installed. Add it to requirements and run pip install -r requirements.txt")
@@ -839,6 +845,10 @@ class MqttMovementPublisher:
         self.client.reconnect_delay_set(min_delay=1, max_delay=5)
         self.client.connect_async(broker_host, int(broker_port), keepalive=30)
         self.client.loop_start()
+
+        if self.heartbeat_interval > 0:
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self._heartbeat_thread.start()
 
     def _on_connect(self, _client, _userdata, _flags, rc, _properties=None):
         self.connected = (rc == 0)
@@ -861,6 +871,17 @@ class MqttMovementPublisher:
         self.connected = False
         if rc != 0:
             print(f"[MQTT] Unexpected disconnect (rc={rc}), retrying...")
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_event.wait(self.heartbeat_interval):
+            if not self.connected:
+                continue
+            if self.last_command != MOVEMENT_SEARCH:
+                continue
+            try:
+                self.client.publish(self.topic, payload=MOVEMENT_SEARCH, qos=0, retain=False)
+            except Exception:
+                pass
 
     def publish(self, command: str, force: bool = False) -> str:
         now = time.time()
@@ -895,6 +916,9 @@ class MqttMovementPublisher:
         return f"failed:{info.rc}"
 
     def close(self):
+        self._stop_event.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=1.0)
         try:
             self.client.loop_stop()
             self.client.disconnect()
@@ -999,8 +1023,26 @@ def parse_args() -> argparse.Namespace:
         "--scan-delay-sec",
         dest="scan_delay_sec",
         type=float,
-        default=3.0,
-        help="Delay before sending SCAN after the locked face is confirmed lost.",
+        default=1.5,
+        help="Delay before sending SEARCH after the locked face is confirmed lost.",
+    )
+    parser.add_argument(
+        "--lost-confirm-frames",
+        type=int,
+        default=8,
+        help="Consecutive frames without locked face before declaring LOST.",
+    )
+    parser.add_argument(
+        "--found-confirm-frames",
+        type=int,
+        default=6,
+        help="Consecutive frames with locked face before resuming track after SEARCH.",
+    )
+    parser.add_argument(
+        "--mqtt-search-heartbeat",
+        type=float,
+        default=0.2,
+        help="Seconds between SEARCH heartbeat re-publishes (keeps ESP32 sweeping).",
     )
     parser.add_argument(
         "--reacquire-hold-sec",
@@ -1217,7 +1259,7 @@ def apply_command_hold(
 ) -> Tuple[str, float]:
     if desired_command == current_command:
         return current_command, changed_at
-    if current_command not in (MOVEMENT_IDLE, MOVEMENT_SCAN) and (now - changed_at) < hold_sec:
+    if current_command not in (MOVEMENT_IDLE, MOVEMENT_SEARCH) and (now - changed_at) < hold_sec:
         return current_command, changed_at
     return desired_command, now
 
@@ -1227,6 +1269,9 @@ def main():
     args.error_smooth_alpha = float(max(0.01, min(1.0, args.error_smooth_alpha)))
     args.command_confirm_frames = int(max(1, args.command_confirm_frames))
     args.scan_delay_sec = float(max(0.0, args.scan_delay_sec))
+    args.lost_confirm_frames = int(max(1, args.lost_confirm_frames))
+    args.found_confirm_frames = int(max(1, args.found_confirm_frames))
+    args.mqtt_search_heartbeat = float(max(0.0, args.mqtt_search_heartbeat))
     args.lock_lost_frames = int(max(1, args.lock_lost_frames))
     args.lock_settle_sec = float(max(0.0, args.lock_settle_sec))
     args.lock_match_margin = float(max(0.0, args.lock_match_margin))
@@ -1365,13 +1410,11 @@ def main():
     pending_track_command: Optional[str] = None
     pending_track_count = 0
     face_missing_since: Optional[float] = None
-    lock_miss_streak = 0
     lock_settle_until = 0.0
     face_lost_logged = False
-    reacquire_hold_until = 0.0
     scan_started_logged = False
-    centering_after_scan = False
-    last_seen_side: Optional[str] = None
+    face_lost_counter = 0
+    face_found_counter = 0
     alert_message = ""
     alert_until = 0.0
     overlay_log = OverlayEventLog()
@@ -1407,6 +1450,7 @@ def main():
                 client_id=args.mqtt_client_id,
                 min_publish_interval=args.mqtt_min_interval,
                 status_min_publish_interval=args.mqtt_status_min_interval,
+                heartbeat_interval=args.mqtt_search_heartbeat,
             )
             mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
         except Exception as e:
@@ -1488,13 +1532,11 @@ def main():
                 pending_track_command = None
                 pending_track_count = 0
                 face_missing_since = None
-                reacquire_hold_until = 0.0
                 scan_started_logged = False
-                lock_miss_streak = 0
                 lock_settle_until = 0.0
                 face_lost_logged = False
-                centering_after_scan = False
-                last_seen_side = None
+                face_lost_counter = 0
+                face_found_counter = 0
                 if mqtt_publisher is not None:
                     mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
             
@@ -1680,187 +1722,134 @@ def main():
                     locked_face_kps = f.kps.copy()
                     locked_face_bbox = [int(f.x1), int(f.y1), int(f.x2), int(f.y2)]
 
-            # Movement command for ESP servo
+            # Movement command for ESP servo (loss/reacquire hysteresis)
             force_command_now = False
             if face_lock and locked_face_found and locked_face_kps is not None:
-                lock_miss_streak = 0
+                face_lost_counter = 0
                 face_lost_logged = False
-                was_missing = face_missing_since is not None
-                was_scanning = (
-                    was_missing
-                    and (current_time - face_missing_since) >= args.scan_delay_sec
-                )
-                if was_missing:
-                    detail = "Target face reacquired"
-                    if was_scanning:
-                        detail += " after SCAN"
-                        # Don't announce "found" yet: keep tracking until the
-                        # camera is actually centered on the target.
-                        centering_after_scan = True
-                    reacquired_action = Action(ActionType.FACE_REACQUIRED, current_time, detail)
-                    face_lock.history.append(reacquired_action)
-                    log_face_actions(action_logger, face_lock.target_name, [reacquired_action])
-                face_missing_since = None
-                scan_started_logged = False
                 raw_error_x = compute_face_error_x(locked_face_kps, frame_width=w)
                 raw_movement_error_x = float(raw_error_x)
 
-                # Remember which side the target is on so we can search that
-                # direction (instead of a blind sweep) if they leave the frame.
-                if raw_error_x <= -args.exit_side_min_px:
-                    last_seen_side = MOVEMENT_LEFT
-                elif raw_error_x >= args.exit_side_min_px:
-                    last_seen_side = MOVEMENT_RIGHT
-
-                if was_scanning:
-                    # Halt the search sweep immediately (bypassing the command
-                    # hold) so the servo does not coast past the target, then
-                    # reset smoothing so centering reacts to the fresh position.
-                    filtered_error_x = raw_error_x
-                    stable_track_command = MOVEMENT_CENTER
-                    pending_track_command = None
-                    pending_track_count = 0
-                    reacquire_hold_until = current_time + args.reacquire_hold_sec
-                    force_command_now = True
-
-                if filtered_error_x is None:
-                    filtered_error_x = raw_error_x
-                else:
-                    filtered_error_x = (
-                        args.error_smooth_alpha * raw_error_x
-                        + (1.0 - args.error_smooth_alpha) * filtered_error_x
-                    )
-                movement_error_x = float(filtered_error_x)
-                tracking_zone = tracking_zone_from_error(movement_error_x, effective_deadzone_px)
-
-                if current_time < reacquire_hold_until:
-                    movement_command = MOVEMENT_IDLE
-                    force_command_now = True
-                elif current_time < lock_settle_until:
-                    movement_command = MOVEMENT_IDLE
-                    tracking_zone = "SETTLING"
-                    force_command_now = True
-                elif centering_after_scan:
-                    # Reacquired during a scan: drive toward center using the
-                    # immediate (unsmoothed) position, re-evaluated every frame
-                    # with no command hold, so it stops the instant it is on the
-                    # target instead of coasting past.
-                    force_command_now = True
-                    if abs(raw_error_x) <= args.found_center_px:
-                        centering_after_scan = False
-                        stable_track_command = MOVEMENT_CENTER
-                        pending_track_command = None
-                        pending_track_count = 0
-                        reacquire_hold_until = current_time + args.reacquire_hold_sec
-                        movement_command = MOVEMENT_IDLE
-                        tracking_zone = "CENTER"
+                if face_missing_since is not None:
+                    # First sight during SEARCH: stop immediately (CENTER), confirm N frames.
+                    face_found_counter += 1
+                    if face_found_counter >= args.found_confirm_frames:
+                        detail = "Target face reacquired"
+                        if scan_started_logged:
+                            detail += " after SEARCH"
+                        reacquired_action = Action(ActionType.FACE_REACQUIRED, current_time, detail)
+                        face_lock.history.append(reacquired_action)
+                        log_face_actions(action_logger, face_lock.target_name, [reacquired_action])
+                        print(f"[FaceLock] {face_lock.target_name} REACQUIRED - tracking")
+                        face_missing_since = None
+                        face_found_counter = 0
+                        scan_started_logged = False
+                        filtered_error_x = None
                         alert_message = f"{args.target_name} found, stop!"
                         alert_until = current_time + 4.0
                         overlay_log.add("search", "FOUND", alert_message)
                         print(f"[Search] {alert_message}")
-                    else:
-                        stable_track_command = (
-                            MOVEMENT_RIGHT if raw_error_x > 0 else MOVEMENT_LEFT
-                        )
-                        movement_command = stable_track_command
-                        tracking_zone = "CENTERING"
+                    movement_command = MOVEMENT_CENTER
+                    movement_error_x = 0.0
+                    tracking_zone = "REACQUIRING"
+                    force_command_now = True
                 else:
-                    reacquire_hold_until = 0.0
-                    desired_track_command = command_from_error_with_hysteresis(
-                        error_x=movement_error_x,
-                        deadzone_px=effective_deadzone_px,
-                        center_exit_hysteresis_px=args.center_exit_hysteresis_px,
-                        previous_command=stable_track_command,
-                    )
-
-                    if desired_track_command == stable_track_command:
-                        pending_track_command = None
-                        pending_track_count = 0
+                    face_found_counter = 0
+                    if filtered_error_x is None:
+                        filtered_error_x = raw_error_x
                     else:
-                        if pending_track_command == desired_track_command:
-                            pending_track_count += 1
-                        else:
-                            pending_track_command = desired_track_command
-                            pending_track_count = 1
-                        if pending_track_count >= args.command_confirm_frames:
-                            stable_track_command = desired_track_command
+                        filtered_error_x = (
+                            args.error_smooth_alpha * raw_error_x
+                            + (1.0 - args.error_smooth_alpha) * filtered_error_x
+                        )
+                    movement_error_x = float(filtered_error_x)
+                    tracking_zone = tracking_zone_from_error(movement_error_x, effective_deadzone_px)
+
+                    if current_time < lock_settle_until:
+                        movement_command = MOVEMENT_IDLE
+                        tracking_zone = "SETTLING"
+                        force_command_now = True
+                    else:
+                        desired_track_command = command_from_error_with_hysteresis(
+                            error_x=movement_error_x,
+                            deadzone_px=effective_deadzone_px,
+                            center_exit_hysteresis_px=args.center_exit_hysteresis_px,
+                            previous_command=stable_track_command,
+                        )
+
+                        if desired_track_command == stable_track_command:
                             pending_track_command = None
                             pending_track_count = 0
+                        else:
+                            if pending_track_command == desired_track_command:
+                                pending_track_count += 1
+                            else:
+                                pending_track_command = desired_track_command
+                                pending_track_count = 1
+                            if pending_track_count >= args.command_confirm_frames:
+                                stable_track_command = desired_track_command
+                                pending_track_command = None
+                                pending_track_count = 0
 
-                    movement_command = stable_track_command
+                        movement_command = stable_track_command
             elif face_lock:
-                lock_miss_streak += 1
-                if lock_miss_streak < args.lock_lost_frames:
-                    movement_command = MOVEMENT_IDLE
-                    movement_error_x = 0.0
-                    raw_movement_error_x = 0.0
-                    tracking_zone = "HOLD"
-                    pending_track_command = None
-                    pending_track_count = 0
-                else:
-                    if face_missing_since is None:
+                face_found_counter = 0
+                face_lost_counter += 1
+                raw_movement_error_x = 0.0
+
+                if face_missing_since is None:
+                    if face_lost_counter >= args.lost_confirm_frames:
                         face_missing_since = current_time
-                    if not face_lost_logged:
-                        lost_action = Action(
-                            ActionType.FACE_LOST,
-                            current_time,
-                            "Target face out of frame or occluded",
-                        )
-                        face_lock.history.append(lost_action)
-                        log_face_actions(action_logger, face_lock.target_name, [lost_action])
-                        face_lost_logged = True
+                        if not face_lost_logged:
+                            lost_action = Action(
+                                ActionType.FACE_LOST,
+                                current_time,
+                                "Target face out of frame or occluded",
+                            )
+                            face_lock.history.append(lost_action)
+                            log_face_actions(action_logger, face_lock.target_name, [lost_action])
+                            face_lost_logged = True
+                            print(
+                                f"[FaceLock] {face_lock.target_name} LOST - holding lock, "
+                                f"will SEARCH after {args.scan_delay_sec}s"
+                            )
+                        face_lost_counter = 0
+                    movement_command = MOVEMENT_CENTER
+                    tracking_zone = "HOLD" if face_missing_since is None else "MISSING"
+                else:
                     lost_for = current_time - face_missing_since
                     if lost_for < args.scan_delay_sec:
-                        movement_command = MOVEMENT_IDLE
+                        movement_command = MOVEMENT_CENTER
                         tracking_zone = "MISSING"
                     else:
-                        searched_for = lost_for - args.scan_delay_sec
-                        use_directional = (
-                            args.directional_search_sec > 0.0
-                            and last_seen_side in (MOVEMENT_LEFT, MOVEMENT_RIGHT)
-                            and searched_for < args.directional_search_sec
-                        )
-                        if use_directional:
-                            movement_command = last_seen_side
-                            search_label = f"toward {last_seen_side}"
-                            tracking_zone = f"SEEK_{last_seen_side}"
-                        else:
-                            movement_command = MOVEMENT_SCAN
-                            search_label = "sweep"
-                            tracking_zone = "MISSING"
+                        movement_command = MOVEMENT_SEARCH
+                        tracking_zone = "SEARCHING"
                         if not scan_started_logged:
-                            detail = (
-                                f"Heading {last_seen_side} to reacquire target"
-                                if use_directional
-                                else "Started SCAN to reacquire target"
-                            )
                             scan_action = Action(
                                 ActionType.SCAN_STARTED,
                                 current_time,
-                                detail,
+                                "Started SEARCH to reacquire target",
                             )
                             face_lock.history.append(scan_action)
                             scan_started_logged = True
-                            scan_msg = f"SEARCHING for {args.target_name} ({search_label})..."
-                            overlay_log.add("search", "SCAN", scan_msg)
+                            scan_msg = f"SEARCHING for {args.target_name}..."
+                            overlay_log.add("search", "SEARCH", scan_msg)
                             log_face_actions(action_logger, face_lock.target_name, [scan_action])
-                    pending_track_command = None
-                    pending_track_count = 0
-                    movement_error_x = 0.0
-                    raw_movement_error_x = 0.0
+
+                movement_error_x = 0.0
+                pending_track_command = None
+                pending_track_count = 0
             else:
                 filtered_error_x = None
                 stable_track_command = MOVEMENT_CENTER
                 pending_track_command = None
                 pending_track_count = 0
                 face_missing_since = None
-                reacquire_hold_until = 0.0
                 scan_started_logged = False
-                lock_miss_streak = 0
                 lock_settle_until = 0.0
                 face_lost_logged = False
-                centering_after_scan = False
-                last_seen_side = None
+                face_lost_counter = 0
+                face_found_counter = 0
                 movement_command = MOVEMENT_IDLE
                 movement_error_x = 0.0
                 raw_movement_error_x = 0.0
@@ -1882,7 +1871,7 @@ def main():
             movement_command = visible_movement_command
 
             active_alert = alert_message if current_time < alert_until else ""
-            is_scanning = movement_command == MOVEMENT_SCAN
+            is_scanning = movement_command == MOVEMENT_SEARCH
 
             status_seq += 1
             status_payload = build_dashboard_status(
@@ -1968,11 +1957,11 @@ def main():
             lock_text = f"LOCKED: {face_lock.target_name}" if face_lock else "UNLOCKED"
             found_text = "found" if locked_face_found else "not found"
             movement_line = f"move={movement_command} zone={tracking_zone} err={movement_error_x:+.1f}px"
-            if movement_command in (MOVEMENT_SCAN, MOVEMENT_IDLE):
+            if movement_command in (MOVEMENT_SEARCH, MOVEMENT_IDLE):
                 movement_line = f"move={movement_command} zone={tracking_zone}"
 
             accent = (85, 210, 160) if face_lock else (210, 210, 210)
-            if movement_command == MOVEMENT_SCAN:
+            if movement_command == MOVEMENT_SEARCH:
                 accent = (70, 150, 255)
             elif movement_command in (MOVEMENT_LEFT, MOVEMENT_RIGHT):
                 accent = (80, 180, 255)
@@ -2152,13 +2141,11 @@ def main():
                     pending_track_command = None
                     pending_track_count = 0
                     face_missing_since = None
-                    reacquire_hold_until = 0.0
                     scan_started_logged = False
-                    lock_miss_streak = 0
                     lock_settle_until = 0.0
                     face_lost_logged = False
-                    centering_after_scan = False
-                    last_seen_side = None
+                    face_lost_counter = 0
+                    face_found_counter = 0
                     if mqtt_publisher is not None:
                         mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
                 # Only allow locking if we have a selected recognized face
@@ -2184,13 +2171,11 @@ def main():
                     pending_track_command = None
                     pending_track_count = 0
                     face_missing_since = None
-                    reacquire_hold_until = 0.0
                     scan_started_logged = False
-                    lock_miss_streak = 0
                     lock_settle_until = current_time + args.lock_settle_sec
                     face_lost_logged = False
-                    centering_after_scan = False
-                    last_seen_side = None
+                    face_lost_counter = 0
+                    face_found_counter = 0
                     print(f"[FaceLock] Locked onto {name} (face {selected_face_index + 1 if selected_face_index is not None else '?'})")
                     # Keep selection for visual feedback, but locking is done
     finally:
